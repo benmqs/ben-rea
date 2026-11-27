@@ -61,7 +61,15 @@ private final class BubbleWindow: NSPanel {
     var onDragMove: (NSPoint) -> Void = { _ in }
     var onDragEnd: (NSPoint) -> Void = { _ in }
     private var downAt: NSPoint?
-    private var dragging = false
+    private(set) var dragging = false
+
+    /// Ends a drag whose mouse-up never reached this window.
+    func cancelDrag() {
+        guard dragging else { return }
+        downAt = nil
+        dragging = false
+        onDragEnd(NSEvent.mouseLocation)
+    }
 
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
@@ -181,7 +189,8 @@ final class BubblePanel {
     }
 
     private static func screen(at point: NSPoint) -> NSScreen? {
-        NSScreen.screens.first { $0.frame.contains(point) }
+        // NSEvent.mouseLocation reaches frame.maxY on the top pixel row, which CGRect.contains excludes.
+        NSScreen.screens.first { NSMouseInRect(point, $0.frame, false) }
     }
 
     private func layout() {
@@ -198,6 +207,8 @@ final class BubblePanel {
     }
 
     private func tick() {
+        // A mouse-up can be lost (Mission Control, screen lock): never leave the drag stuck.
+        if panel.dragging, NSEvent.pressedMouseButtons & 1 == 0 { panel.cancelDrag() }
         guard !model.dragging else { return }
         let mouse = NSEvent.mouseLocation
 
@@ -210,9 +221,19 @@ final class BubblePanel {
 
         var hovered: Set<HoverTarget> = []
         let frame = panel.frame
-        if frame.contains(mouse) {
-            let local = CGPoint(x: mouse.x - frame.minX, y: frame.maxY - mouse.y)
-            for (target, rect) in model.frames where rect.contains(local) { hovered.insert(target) }
+        let local = CGPoint(x: mouse.x - frame.minX, y: frame.maxY - mouse.y)
+        // Stretch the pill's rect to the screen edge it is docked to, so pushing the pointer
+        // against that edge still counts as hovering.
+        let reach = Self.margin + 3
+        for (target, var rect) in model.frames {
+            if target == .pill {
+                switch model.dock {
+                case .bottom: rect.size.height += reach          // local y grows downward
+                case .left: rect.origin.x -= reach; rect.size.width += reach
+                case .right: rect.size.width += reach
+                }
+            }
+            if rect.contains(local) { hovered.insert(target) }
         }
         if hovered != model.hovered { model.hovered = hovered }
         let ignore = !hovered.contains(.pill)
