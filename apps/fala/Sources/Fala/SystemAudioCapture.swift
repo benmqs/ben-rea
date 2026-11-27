@@ -45,7 +45,7 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio, sampleBuffer.isValid,
               let description = sampleBuffer.formatDescription,
-              let format = AVAudioFormat(cmAudioFormatDescription: description) else { return }
+              case let format = AVAudioFormat(cmAudioFormatDescription: description) else { return }
         try? sampleBuffer.withAudioBufferList { list, _ in
             guard let pcm = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: UnsafePointer(list.unsafePointer)) else { return }
             let samples = resampler.convert(pcm)
