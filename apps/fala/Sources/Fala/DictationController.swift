@@ -174,9 +174,12 @@ final class DictationController: ObservableObject {
 
         do {
             show(.transcribing)
+            let clock = ContinuousClock()
+            let t0 = clock.now
             let raw = try await transcriber.transcribe(
                 samples, language: settings.language.whisperCode, model: settings.whisperModel
             )
+            let whisperTime = clock.now - t0
             guard !raw.isEmpty else {
                 show(.error("Didn't catch that"), hideAfter: 2)
                 return
@@ -184,7 +187,9 @@ final class DictationController: ObservableObject {
 
             var text = raw
             var note: String?
-            if settings.cleanupEnabled {
+            let t1 = clock.now
+            // Without an API key there is nothing to call: paste the raw transcript straight away.
+            if settings.cleanupEnabled, !settings.anthropicKey.isEmpty {
                 show(.cleaning)
                 do {
                     text = try await TextCleaner(client: claude, vocabulary: settings.vocabularyList).clean(raw)
@@ -196,8 +201,12 @@ final class DictationController: ObservableObject {
 
             lastText = text
             let outcome = await TextInserter.insert(text)
-            let label = outcome == .pasted ? "Pasted" : "Copied — press ⌘V"
-            show(note == nil ? .done(label) : .error("\(label) (raw)"), hideAfter: 1.6)
+            // Show how long each step took, so slow steps are easy to spot.
+            let seconds = { (d: Duration) in String(format: "%.1fs", Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18) }
+            let timing = "speech \(seconds(whisperTime)) · polish \(seconds(clock.now - t1))"
+            NSLog("Fala timing: %@ for %.1fs of audio", timing, Double(samples.count) / AudioRecorder.sampleRate)
+            let label = (outcome == .pasted ? "Pasted" : "Copied, press ⌘V") + " · " + timing
+            show(note == nil ? .done(label) : .error("\(label) (raw)"), hideAfter: 3)
             if let note { NSLog("Fala clean-up: %@", note) }
         } catch {
             show(.error("Transcription failed"), hideAfter: 3)

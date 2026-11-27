@@ -49,7 +49,7 @@ final class AppSettings: ObservableObject {
     @AppStorage("language") var language: SpokenLanguage = .auto
     @AppStorage("whisperModel") var whisperModel: String = "openai_whisper-large-v3-v20240930_turbo"
     @AppStorage("cleanupEnabled") var cleanupEnabled: Bool = true
-    @AppStorage("cleanupModel") var cleanupModel: String = "claude-opus-5-5"
+    @AppStorage("cleanupModel") var cleanupModel: String = "claude-haiku-5-5"
     /// Names, brands and jargon Whisper and the cleanup step should spell correctly, one per line.
     @AppStorage("vocabulary") var vocabulary: String = ""
 
@@ -118,8 +118,8 @@ struct SettingsView: View {
             Section("Clean-up with Claude") {
                 Toggle("Clean up text before pasting", isOn: Binding(get: { s.cleanupEnabled }, set: { s.cleanupEnabled = $0 }))
                 Picker("Model", selection: Binding(get: { s.cleanupModel }, set: { s.cleanupModel = $0 })) {
-                    Text("Claude Opus 5.5 (best)").tag("claude-opus-5-5")
-                    Text("Claude Haiku 5.5 (fastest, cheapest)").tag("claude-haiku-5-5")
+                    Text("Claude Haiku 5.5 (fast, about $0.0001 per dictation)").tag("claude-haiku-5-5")
+                    Text("Claude Opus 5.5 (most careful, slower, about $0.005)").tag("claude-opus-5-5")
                 }
                 SecureField("Anthropic API key", text: $key)
                     .onSubmit { s.anthropicKey = key }
