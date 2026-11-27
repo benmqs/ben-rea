@@ -1,84 +1,153 @@
 import AppKit
 import SwiftUI
 
-/// Hover state and measured pill size, shared between the AppKit panel and the SwiftUI view.
+/// Where the pill rests: bottom centre, or the middle of the left or right edge.
+enum BubbleDock: String, Sendable {
+    case bottom, left, right
+}
+
+/// Parts of the pill the mouse can be over. `pill` is the whole pill.
+enum HoverTarget: Hashable, Sendable {
+    case pill, dictate, meeting, cancel, confirm, stop
+}
+
+/// State shared between the AppKit panel and the SwiftUI views.
 final class BubbleModel: ObservableObject, @unchecked Sendable {
-    @Published var hovering = false
-    var onSize: @MainActor (CGSize) -> Void = { _ in }
+    @Published var hovered: Set<HoverTarget> = []
+    @Published var dock = BubbleDock(rawValue: UserDefaults.standard.string(forKey: "bubbleDock") ?? "") ?? .bottom
+    /// True while the pill is being dragged to another dock (and a moment after, to swallow the click).
+    @Published var dragging = false
+    /// The dock the pill would land on if the drag ended now.
+    @Published var dropTarget = BubbleDock.bottom
+    /// Space taken by the Dock and menu bar on the dragged-over screen: bottom, left, right.
+    @Published var insets: (bottom: CGFloat, left: CGFloat, right: CGFloat) = (0, 0, 0)
+
+    /// Frames of the hover targets in panel coordinates (top-left origin), written by SwiftUI layout.
+    var frames: [HoverTarget: CGRect] = [:]
 
     /// Safe to call from any context (onPreferenceChange is @Sendable on recent SDKs).
-    func report(_ size: CGSize) {
-        Task { @MainActor in self.onSize(size) }
+    func report(_ frames: [HoverTarget: CGRect]) {
+        Task { @MainActor in self.frames = frames }
     }
 }
 
-private struct BubbleSizeKey: PreferenceKey {
-    static let defaultValue = CGSize.zero
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) { value = nextValue() }
+private struct HoverFramesKey: PreferenceKey {
+    static let defaultValue: [HoverTarget: CGRect] = [:]
+    static func reduce(value: inout [HoverTarget: CGRect], nextValue: () -> [HoverTarget: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
 }
 
-/// Hosting view that reports hover from AppKit (works while Fala is not the active app)
-/// and accepts the first click.
+private extension View {
+    /// Registers this view's frame so the panel can tell when the mouse is over it.
+    func hoverTarget(_ target: HoverTarget, pad: CGFloat = 0) -> some View {
+        background(GeometryReader { proxy in
+            Color.clear.preference(
+                key: HoverFramesKey.self,
+                value: [target: proxy.frame(in: .named("bubble")).insetBy(dx: -pad, dy: -pad)])
+        })
+    }
+}
+
+/// Hosting view that takes the first click even though Fala is never the active app.
 private final class BubbleHostingView<Content: View>: NSHostingView<Content> {
-    var onHover: (Bool) -> Void = { _ in }
-    private var hoverArea: NSTrackingArea?
-
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let hoverArea { removeTrackingArea(hoverArea) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        hoverArea = area
-    }
+/// The pill's window. It watches mouse drags so the pill can be moved to another dock,
+/// and otherwise passes every event on untouched.
+private final class BubbleWindow: NSPanel {
+    var onDragStart: () -> Void = {}
+    var onDragMove: (NSPoint) -> Void = { _ in }
+    var onDragEnd: (NSPoint) -> Void = { _ in }
+    private var downAt: NSPoint?
+    private var dragging = false
 
-    override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        if event.trackingArea === hoverArea { onHover(true) }
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        if event.trackingArea === hoverArea { onHover(false) }
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            downAt = NSEvent.mouseLocation
+            dragging = false
+        case .leftMouseDragged:
+            if let downAt {
+                let mouse = NSEvent.mouseLocation
+                if !dragging, hypot(mouse.x - downAt.x, mouse.y - downAt.y) > 6 {
+                    dragging = true
+                    onDragStart()
+                }
+                if dragging {
+                    onDragMove(mouse)
+                    return
+                }
+            }
+        case .leftMouseUp:
+            downAt = nil
+            if dragging {
+                dragging = false
+                super.sendEvent(event)      // lets SwiftUI finish its own tracking
+                onDragEnd(NSEvent.mouseLocation)
+                return
+            }
+        default:
+            break
+        }
+        super.sendEvent(event)
     }
 }
 
-/// The floating bubble at the bottom centre of the screen. The panel is always exactly as big
-/// as what is drawn, so it never blocks clicks on the windows around it, and it never takes focus.
+/// The floating pill. Its window has a fixed size and is transparent; it ignores the mouse
+/// except while the pointer is over the pill itself, so it never blocks the windows around it,
+/// and it never takes focus.
 @MainActor
 final class BubblePanel {
-    private let panel: NSPanel
+    private static let size = NSSize(width: 480, height: 130)
+    private static let margin: CGFloat = 3
+
+    private let panel: BubbleWindow
+    private let overlay: NSPanel
     private let model = BubbleModel()
-    private var contentSize = NSSize(width: 84, height: 36)
+    private weak var controller: DictationController?
     private var screen: NSScreen?
-    private var shrinkTask: Task<Void, Never>?
+    private var timer: Timer?
 
     init(controller: DictationController) {
-        panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: contentSize),
+        self.controller = controller
+        panel = BubbleWindow(
+            contentRect: NSRect(origin: .zero, size: Self.size),
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
             defer: false
         )
-        panel.isFloatingPanel = true
-        panel.level = .statusBar
-        panel.backgroundColor = .clear
-        panel.isOpaque = false
-        panel.hasShadow = false
-        panel.hidesOnDeactivate = false   // NSPanel defaults to true: the bubble would vanish
-        panel.becomesKeyOnlyIfNeeded = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        overlay = NSPanel(
+            contentRect: .zero,
+            styleMask: [.nonactivatingPanel, .borderless],
+            backing: .buffered,
+            defer: false
+        )
+        for window in [panel, overlay] {
+            window.isFloatingPanel = true
+            window.level = .statusBar
+            window.backgroundColor = .clear
+            window.isOpaque = false
+            window.hasShadow = false
+            window.hidesOnDeactivate = false   // NSPanel defaults to true: the pill would vanish
+            window.becomesKeyOnlyIfNeeded = true
+            window.ignoresMouseEvents = true
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        }
 
         let host = BubbleHostingView(
             rootView: BubbleView().environmentObject(controller).environmentObject(model)
         )
-        host.sizingOptions = []           // the window is sized by resize(to:)
-        host.onHover = { [weak self] inside in self?.setHovering(inside) }
+        host.sizingOptions = []
         panel.contentView = host
-        model.onSize = { [weak self] size in self?.resize(to: size) }
+        let overlayHost = NSHostingView(rootView: DockOverlayView().environmentObject(model))
+        overlayHost.sizingOptions = []
+        overlay.contentView = overlayHost
+
+        panel.onDragStart = { [weak self] in self?.dragStarted() }
+        panel.onDragMove = { [weak self] in self?.dragMoved(to: $0) }
+        panel.onDragEnd = { [weak self] in self?.dragEnded(at: $0) }
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -94,46 +163,100 @@ final class BubblePanel {
     func show() {
         position()
         panel.orderFrontRegardless()
+        guard timer == nil else { return }
+        // Polling the pointer is the only hover signal that works for a window that ignores
+        // the mouse, and it also lets the pill follow the pointer to another display.
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        timer.tolerance = 0.01
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
-    /// Moves the bubble to the screen the mouse is on.
+    /// Moves the pill to the screen the mouse is on.
     func position() {
-        screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        screen = Self.screen(at: NSEvent.mouseLocation) ?? NSScreen.main
         layout()
     }
 
-    private func resize(to size: CGSize) {
-        guard size.width > 1, size.height > 1 else { return }
-        shrinkTask?.cancel()
-        if size.width > contentSize.width || size.height > contentSize.height {
-            contentSize = NSSize(width: max(size.width, contentSize.width),
-                                 height: max(size.height, contentSize.height))
-            layout()
-        }
-        if size != contentSize {
-            // Shrink after the exit animation, so it is not clipped by the smaller window.
-            shrinkTask = Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(300))
-                guard !Task.isCancelled, let self else { return }
-                self.contentSize = size
-                self.layout()
-            }
-        }
+    private static func screen(at point: NSPoint) -> NSScreen? {
+        NSScreen.screens.first { $0.frame.contains(point) }
     }
 
     private func layout() {
         guard let visible = (screen ?? NSScreen.main)?.visibleFrame else { return }
-        let width = min(ceil(contentSize.width), visible.width - 40)
-        let height = ceil(contentSize.height)
-        let frame = NSRect(x: (visible.midX - width / 2).rounded(), y: visible.minY + 6,
-                           width: width, height: height)
+        let size = Self.size
+        let origin: NSPoint
+        switch model.dock {
+        case .bottom: origin = NSPoint(x: visible.midX - size.width / 2, y: visible.minY + Self.margin)
+        case .left: origin = NSPoint(x: visible.minX + Self.margin, y: visible.midY - size.height / 2)
+        case .right: origin = NSPoint(x: visible.maxX - size.width - Self.margin, y: visible.midY - size.height / 2)
+        }
+        let frame = NSRect(origin: NSPoint(x: origin.x.rounded(), y: origin.y.rounded()), size: size)
         if panel.frame != frame { panel.setFrame(frame, display: true) }
-        // A resize under a still mouse sends no enter/exit event, so resync.
-        setHovering(frame.contains(NSEvent.mouseLocation))
     }
 
-    private func setHovering(_ inside: Bool) {
-        if model.hovering != inside { model.hovering = inside }
+    private func tick() {
+        guard !model.dragging else { return }
+        let mouse = NSEvent.mouseLocation
+
+        // Follow the display in use, but never jump in the middle of a dictation or a meeting.
+        if controller?.state.isResting == true, NSEvent.pressedMouseButtons == 0,
+           let current = Self.screen(at: mouse), current != screen {
+            screen = current
+            layout()
+        }
+
+        var hovered: Set<HoverTarget> = []
+        let frame = panel.frame
+        if frame.contains(mouse) {
+            let local = CGPoint(x: mouse.x - frame.minX, y: frame.maxY - mouse.y)
+            for (target, rect) in model.frames where rect.contains(local) { hovered.insert(target) }
+        }
+        if hovered != model.hovered { model.hovered = hovered }
+        let ignore = !hovered.contains(.pill)
+        if panel.ignoresMouseEvents != ignore { panel.ignoresMouseEvents = ignore }
+    }
+
+    // MARK: Dragging to another dock
+
+    private func dragStarted() {
+        model.dragging = true
+        model.hovered = []
+        dragMoved(to: NSEvent.mouseLocation)
+        overlay.orderFront(nil)
+        panel.orderFrontRegardless()
+    }
+
+    private func dragMoved(to mouse: NSPoint) {
+        guard let target = Self.screen(at: mouse) ?? screen ?? NSScreen.main else { return }
+        let frame = target.frame, visible = target.visibleFrame
+        if overlay.frame != frame { overlay.setFrame(frame, display: true) }
+        model.insets = (visible.minY - frame.minY, visible.minX - frame.minX, frame.maxX - visible.maxX)
+
+        func distance(_ x: CGFloat, _ y: CGFloat) -> CGFloat { hypot(mouse.x - x, mouse.y - y) }
+        let candidates: [(BubbleDock, CGFloat)] = [
+            (.bottom, distance(visible.midX, visible.minY)),
+            (.left, distance(visible.minX, visible.midY)),
+            (.right, distance(visible.maxX, visible.midY)),
+        ]
+        let nearest = candidates.min { $0.1 < $1.1 }?.0 ?? .bottom
+        if model.dropTarget != nearest { model.dropTarget = nearest }
+    }
+
+    private func dragEnded(at mouse: NSPoint) {
+        dragMoved(to: mouse)
+        overlay.orderOut(nil)
+        model.dock = model.dropTarget
+        UserDefaults.standard.set(model.dock.rawValue, forKey: "bubbleDock")
+        screen = Self.screen(at: mouse) ?? screen
+        layout()
+        // The mouse-up that ended the drag must not count as a click on the pill.
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            self?.model.dragging = false
+        }
     }
 }
 
@@ -142,49 +265,92 @@ final class BubblePanel {
 /// Monochrome: a black pill with white marks, the way dictation pills usually look.
 private enum Look {
     static let body = Color.black.opacity(0.92)
-    static let edge = Color.white.opacity(0.22)
+    static let edge = Color.white.opacity(0.28)
     static let mark = Color.white
     static let dim = Color.white.opacity(0.6)
     static let recording = Color(red: 1.0, green: 0.27, blue: 0.23)
     static let warning = Color(red: 1.0, green: 0.72, blue: 0.2)
     static let font = Font.system(size: 12.5, weight: .medium)
+    static let spring = Animation.spring(response: 0.26, dampingFraction: 0.84)
 }
 
 struct BubbleView: View {
     @EnvironmentObject var controller: DictationController
     @EnvironmentObject var model: BubbleModel
 
+    private var hot: Bool { model.hovered.contains(.pill) }
+    private var vertical: Bool { model.dock != .bottom }
+
     var body: some View {
-        VStack(spacing: 7) {
-            if let hint { HintToast(text: hint) }
-            pill
-        }
-        .contextMenu { BubbleMenu() }
-        .padding(.horizontal, 12)
-        .padding(.top, 10)            // room for the shadow
-        .padding(.bottom, 2)
-        .fixedSize()
-        .background(GeometryReader { proxy in
-            Color.clear.preference(key: BubbleSizeKey.self, value: proxy.size)
-        })
-        .onPreferenceChange(BubbleSizeKey.self) { [model] size in model.report(size) }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        .animation(.spring(response: 0.28, dampingFraction: 0.82), value: controller.state)
-        .animation(.spring(response: 0.28, dampingFraction: 0.82), value: controller.handsFree)
-        .animation(.easeOut(duration: 0.15), value: model.hovering)
+        arranged
+            .padding(2)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
+            .coordinateSpace(name: "bubble")
+            .onPreferenceChange(HoverFramesKey.self) { [model] frames in model.report(frames) }
+            .opacity(model.dragging ? 0 : 1)
+            .ignoresSafeArea()
+            .animation(Look.spring, value: controller.state)
+            .animation(Look.spring, value: model.hovered)
+            .animation(Look.spring, value: model.dock)
     }
 
-    /// The small dark toast above the pill.
-    private var hint: String? {
+    private var alignment: Alignment {
+        switch model.dock {
+        case .bottom: .bottom
+        case .left: .leading
+        case .right: .trailing
+        }
+    }
+
+    /// The toast sits above the pill at the bottom dock, and beside it at the side docks.
+    @ViewBuilder private var arranged: some View {
+        switch model.dock {
+        case .bottom: VStack(spacing: 5) { toast; target }
+        case .left: HStack(spacing: 6) { target; toast }
+        case .right: HStack(spacing: 6) { toast; target }
+        }
+    }
+
+    @ViewBuilder private var toast: some View {
+        if let hint { HintToast(text: hint) }
+    }
+
+    private var target: some View {
+        pill
+            .padding(5)                       // a slightly larger target for hover and right-click
+            .contentShape(Rectangle())
+            .hoverTarget(.pill)
+            .contextMenu { BubbleMenu() }
+    }
+
+    /// Runs a click, unless it is the mouse-up that ended a drag.
+    private func act(_ action: () -> Void) {
+        guard !model.dragging else { return }
+        action()
+    }
+
+    private var key: Text { Text(controller.settings.hotkey.label).bold().foregroundColor(Look.mark) }
+
+    /// The small dark toast next to the pill.
+    private var hint: Text? {
         switch controller.state {
-        case .idle where model.hovering:
-            return "Click or hold \(controller.settings.hotkey.label) to start dictating"
-        case .listening where controller.handsFree:
-            return "Click ✓ to finish and paste"
+        case .idle where model.hovered.contains(.meeting):
+            return Text("Record a meeting")
+        case .idle where hot:
+            return Text("Dictate  ").foregroundColor(Look.dim) + key
+        case .listening where model.hovered.contains(.cancel):
+            return Text("Cancel")
+        case .listening where model.hovered.contains(.confirm):
+            return Text("Finish and paste")
+        case .listening where hot:
+            return Text(controller.handsFree ? "Press " : "Release ").foregroundColor(Look.dim) + key
+                + Text(" to finish and paste").foregroundColor(Look.dim)
+        case .meetingRecording where hot:
+            return Text(model.hovered.contains(.stop) ? "Stop and write the notes" : "Recording meeting")
+        case .transcribing where hot, .cleaning where hot:
+            return Text(controller.state.bubbleLabel)
         case .loadingModel, .meetingProcessing, .done, .error, .needsPermission:
-            return controller.state.bubbleLabel
-        case .meetingRecording where model.hovering:
-            return "Recording meeting. Click ■ to stop and transcribe"
+            return Text(controller.state.bubbleLabel)
         default:
             return nil
         }
@@ -193,39 +359,61 @@ struct BubbleView: View {
     @ViewBuilder private var pill: some View {
         switch controller.state {
         case .idle:
-            if model.hovering {
-                capsule(height: 26) { Dots(count: 9, color: Look.dim) }
-                    .onTapGesture { controller.toggleDictation() }
+            if hot {
+                // Two buttons: dictate, and record a meeting.
+                let layout = vertical ? AnyLayout(VStackLayout(spacing: 5)) : AnyLayout(HStackLayout(spacing: 5))
+                layout {
+                    Button { act { controller.toggleDictation() } } label: {
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Look.mark)
+                            .frame(width: vertical ? 28 : 36, height: vertical ? 36 : 28)
+                            .background(Capsule().fill(Look.body))
+                            .overlay(Capsule().strokeBorder(Look.edge, lineWidth: 1))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .hoverTarget(.dictate)
+                    Button { act { controller.toggleMeeting() } } label: {
+                        Image(systemName: "record.circle")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Look.mark)
+                            .frame(width: 28, height: 28)
+                            .background(Circle().fill(Look.body))
+                            .overlay(Circle().strokeBorder(Look.edge, lineWidth: 1))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .hoverTarget(.meeting)
+                }
+                .shadow(color: .black.opacity(0.35), radius: 5, y: 2)
+                .transition(.scale(scale: 0.6).combined(with: .opacity))
             } else {
-                // Resting: a small, quiet pill so you always know where to click.
+                // Resting: a small, quiet pill that is always on screen.
                 Capsule()
-                    .fill(Look.body)
-                    .overlay(Capsule().strokeBorder(Look.edge, lineWidth: 1))
-                    .frame(width: 42, height: 9)
-                    .padding(.horizontal, 10).padding(.top, 8)   // larger target for hover and click
-                    .contentShape(Rectangle())
-                    .onTapGesture { controller.toggleDictation() }
+                    .fill(Color.black.opacity(0.75))
+                    .overlay(Capsule().strokeBorder(Color.white.opacity(0.55), lineWidth: 1))
+                    .frame(width: vertical ? 8 : 40, height: vertical ? 40 : 8)
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
             }
 
         case .listening:
             capsule(height: 32) {
-                if controller.handsFree {
-                    roundButton("xmark", fill: .white.opacity(0.22), mark: Look.mark, help: "Cancel") {
-                        controller.cancelDictation()
-                    }
+                roundButton("xmark", fill: .white.opacity(0.22), mark: Look.mark) {
+                    controller.cancelDictation()
                 }
+                .hoverTarget(.cancel)
                 LevelBars(level: controller.level, color: Look.mark)
-                    .padding(.horizontal, controller.handsFree ? 2 : 8)
-                if controller.handsFree {
-                    roundButton("checkmark", fill: Look.mark, mark: .black, help: "Finish and paste") {
-                        controller.toggleDictation()
-                    }
+                    .padding(.horizontal, 2)
+                roundButton("checkmark", fill: Look.mark, mark: .black) {
+                    controller.finishDictation()
                 }
+                .hoverTarget(.confirm)
             }
 
         case .transcribing, .cleaning, .loadingModel, .meetingProcessing:
             capsule(height: 26) { Dots(count: 5, color: Look.mark, animated: true) }
-                .onTapGesture { controller.toggleDictation() }
+                .onTapGesture { act { controller.toggleDictation() } }
 
         case .meetingRecording:
             capsule(height: 32) {
@@ -233,9 +421,10 @@ struct BubbleView: View {
                 Text(controller.state.bubbleLabel)
                     .font(Look.font.monospacedDigit())
                     .foregroundStyle(Look.mark)
-                roundButton("stop.fill", fill: Look.mark, mark: .black, help: "Stop and transcribe") {
+                roundButton("stop.fill", fill: Look.mark, mark: .black) {
                     controller.toggleMeeting()
                 }
+                .hoverTarget(.stop)
             }
 
         case .done:
@@ -243,20 +432,20 @@ struct BubbleView: View {
                 Image(systemName: "checkmark").font(.system(size: 11, weight: .bold)).foregroundStyle(Look.mark)
                     .padding(.horizontal, 8)
             }
-            .onTapGesture { controller.toggleDictation() }
+            .onTapGesture { act { controller.toggleDictation() } }
 
         case .error:
             capsule(height: 26) {
                 Image(systemName: "exclamationmark").font(.system(size: 11, weight: .bold))
                     .foregroundStyle(Look.warning).padding(.horizontal, 10)
             }
-            .onTapGesture { controller.toggleDictation() }
+            .onTapGesture { act { controller.toggleDictation() } }
 
         case .needsPermission(let permission):
             capsule(height: 32) {
                 Image(systemName: "lock.fill").font(.system(size: 11)).foregroundStyle(Look.warning)
                     .padding(.leading, 8)
-                Button("Open Settings") { permission.openSettings() }
+                Button("Open Settings") { act { permission.openSettings() } }
                     .buttonStyle(.plain)
                     .font(Look.font)
                     .foregroundStyle(.black)
@@ -274,12 +463,12 @@ struct BubbleView: View {
             .overlay(Capsule().strokeBorder(Look.edge, lineWidth: 1))
             .shadow(color: .black.opacity(0.35), radius: 5, y: 2)
             .contentShape(Capsule())
-            .transition(.scale(scale: 0.7, anchor: .bottom).combined(with: .opacity))
+            .transition(.scale(scale: 0.7).combined(with: .opacity))
     }
 
-    private func roundButton(_ symbol: String, fill: Color, mark: Color, help: String,
+    private func roundButton(_ symbol: String, fill: Color, mark: Color,
                              action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+        Button { act(action) } label: {
             Image(systemName: symbol)
                 .font(.system(size: 10, weight: .heavy))
                 .foregroundStyle(mark)
@@ -288,25 +477,55 @@ struct BubbleView: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .help(help)
+    }
+}
+
+/// Shown over the whole screen while the pill is dragged: the three places it can rest,
+/// with the nearest one lit.
+struct DockOverlayView: View {
+    @EnvironmentObject var model: BubbleModel
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.5)
+            slot(.bottom, alignment: .bottom).padding(.bottom, model.insets.bottom + 8)
+            slot(.left, alignment: .leading).padding(.leading, model.insets.left + 8)
+            slot(.right, alignment: .trailing).padding(.trailing, model.insets.right + 8)
+        }
+        .ignoresSafeArea()
+        .animation(.easeOut(duration: 0.12), value: model.dropTarget)
+    }
+
+    private func slot(_ dock: BubbleDock, alignment: Alignment) -> some View {
+        let active = model.dropTarget == dock
+        let vertical = dock != .bottom
+        return RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .fill(Color.white.opacity(active ? 0.92 : 0.4))
+            .frame(width: vertical ? 40 : 64, height: vertical ? 64 : 40)
+            .scaleEffect(active ? 1.1 : 1)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
     }
 }
 
 /// Dark rounded toast shown above the pill.
 struct HintToast: View {
-    let text: String
+    let text: Text
 
     var body: some View {
-        Text(text)
+        text
             .font(Look.font)
             .foregroundStyle(Look.mark)
-            .lineLimit(1)
+            .lineLimit(2)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: 380)
+            .fixedSize()
             .padding(.horizontal, 12)
-            .frame(height: 28)
+            .frame(minHeight: 28)
             .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Look.body))
             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Look.edge, lineWidth: 1))
             .shadow(color: .black.opacity(0.35), radius: 5, y: 2)
-            .transition(.opacity.combined(with: .offset(y: 4)))
+            .transition(.opacity)
     }
 }
 

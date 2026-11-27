@@ -181,6 +181,12 @@ final class DictationController: ObservableObject {
         }
     }
 
+    /// The ✓ on the pill: finish and paste, however the dictation was started.
+    func finishDictation() {
+        guard state == .listening else { return }
+        Task { await finishRecording(force: true) }
+    }
+
     /// Stops listening and throws the audio away.
     func cancelDictation() {
         guard state == .listening else { return }
@@ -197,6 +203,11 @@ final class DictationController: ObservableObject {
     }
 
     private func beginRecording(handsFree: Bool = false) {
+        // Pressing the key during a click-started dictation finishes it.
+        if state == .listening, self.handsFree, !handsFree {
+            finishDictation()
+            return
+        }
         // The microphone is busy while a meeting records; never start over a pending permission prompt.
         guard isReadyForDictation else { return }
         do {
