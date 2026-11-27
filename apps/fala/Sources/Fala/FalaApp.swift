@@ -38,6 +38,16 @@ struct MenuContent: View {
             Button("Copy last dictation") { Clipboard.set(last) }
         }
         Divider()
+        Button(controller.state.isMeeting ? "Stop meeting recording" : "Record a meeting") {
+            controller.toggleMeeting()
+        }
+        .disabled({ if case .meetingProcessing = controller.state { return true } else { return false } }())
+        Button("Open meeting notes folder") {
+            let folder = URL.documentsDirectory.appending(path: "Fala/Meetings", directoryHint: .isDirectory)
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(controller.lastMeetingFolder ?? folder)
+        }
+        Divider()
         Text("Hold \(controller.settings.hotkey.label) to dictate")
         SettingsLink { Text("Settings…") }
         Button("Quit Fala") { NSApp.terminate(nil) }

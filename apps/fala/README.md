@@ -8,7 +8,11 @@ A macOS menu bar app for voice typing and meeting notes.
 - **Bubble:** a small pill at the bottom of the screen shows listening (with a live
   level), transcribing, polishing and pasted/copied.
 - **Languages:** Portuguese, English and Spanish, or auto-detect.
-- **Meetings:** coming next (mic + system audio, transcript and summary).
+- **Meetings:** choose **Record a meeting** from the menu bar icon. Fala records your
+  microphone and the computer's audio (Zoom, Meet, Teams…) as separate tracks, so the
+  transcript can label lines **You** and **Others**. When you stop, it transcribes
+  locally, writes notes with Claude (summary, decisions, action items) and opens
+  `~/Documents/Fala/Meetings/<date>/notes.md`. The audio files stay in that folder.
 
 ## Requirements
 
@@ -29,6 +33,8 @@ On first launch macOS asks for:
 1. **Microphone**: allow.
 2. **Accessibility** (System Settings > Privacy & Security > Accessibility): turn on Fala.
    This lets Fala see the push-to-talk key in other apps and paste for you.
+3. **Screen & System Audio Recording** (asked the first time you record a meeting): allow.
+   Fala only uses the audio; it doesn't save any video.
 
 The first run downloads the Whisper model (about 1.5 GB) from Hugging Face; after that
 transcription works offline. Open **Settings…** from the menu bar icon to add your
@@ -44,4 +50,14 @@ Anthropic API key, pick the key, language and model, and add names Fala should s
 | `TextCleaner.swift` | Sends the transcript to the Claude Messages API for clean-up |
 | `TextInserter.swift` | Pastes into the focused text field, or copies when there isn't one |
 | `Bubble.swift` | The floating status pill |
+| `SystemAudioCapture.swift` | Captures the computer's audio for meetings (ScreenCaptureKit) |
+| `MeetingSession.swift` | Meeting folder, audio files, You/Others transcript and notes file |
 | `DictationController.swift` | Ties the steps together |
+
+## Known limits
+
+- Without headphones, the mic also picks up the other people, so some of their lines can
+  appear twice (once as You). Headphones give the cleanest transcript.
+- Push-to-talk dictation is paused while a meeting is recording.
+- Long silences on the system-audio track can make Whisper invent a short phrase
+  ("Obrigado.", "Thank you."). Voice-activity filtering is a planned improvement.

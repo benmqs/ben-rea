@@ -60,6 +60,7 @@ struct BubbleView: View {
     private var accent: Color {
         switch controller.state {
         case .listening: Color(red: 0.36, green: 0.85, blue: 0.67)
+        case .meetingRecording: Color(red: 1.0, green: 0.38, blue: 0.38)
         case .error: .orange
         default: Color(red: 0.55, green: 0.62, blue: 1.0)
         }
@@ -69,7 +70,9 @@ struct BubbleView: View {
         switch controller.state {
         case .listening:
             LevelBars(level: controller.level, color: accent)
-        case .transcribing, .cleaning, .loadingModel:
+        case .meetingRecording:
+            Circle().fill(accent).frame(width: 9, height: 9)
+        case .transcribing, .cleaning, .loadingModel, .meetingProcessing:
             ProgressView().controlSize(.small).tint(.white)
         case .done:
             Image(systemName: "checkmark").foregroundStyle(accent)
