@@ -9,6 +9,24 @@ enum Clipboard {
     }
 }
 
+enum Permission: Equatable {
+    case accessibility, microphone
+
+    var message: String {
+        switch self {
+        case .accessibility: "Turn on Accessibility for Fala"
+        case .microphone: "Allow microphone access for Fala"
+        }
+    }
+
+    func openSettings() {
+        let pane = self == .accessibility ? "Privacy_Accessibility" : "Privacy_Microphone"
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+}
+
 enum Permissions {
     static var hasAccessibility: Bool { AXIsProcessTrusted() }
 

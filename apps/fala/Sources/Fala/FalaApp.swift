@@ -42,13 +42,9 @@ struct MenuContent: View {
             controller.toggleMeeting()
         }
         .disabled({ if case .meetingProcessing = controller.state { return true } else { return false } }())
-        Button("Open meeting notes folder") {
-            let folder = URL.documentsDirectory.appending(path: "Fala/Meetings", directoryHint: .isDirectory)
-            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            NSWorkspace.shared.open(controller.lastMeetingFolder ?? folder)
-        }
+        Button("Open meeting notes folder") { controller.openMeetingsFolder() }
         Divider()
-        Text("Hold \(controller.settings.hotkey.label) to dictate")
+        Text("Click the bubble or hold \(controller.settings.hotkey.label) to dictate")
         SettingsLink { Text("Settings…") }
         Button("Quit Fala") { NSApp.terminate(nil) }
             .keyboardShortcut("q")

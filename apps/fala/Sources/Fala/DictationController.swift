@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import SwiftUI
 
 enum DictationState: Equatable {
@@ -11,6 +12,7 @@ enum DictationState: Equatable {
     case meetingProcessing(String)
     case done(String)
     case error(String)
+    case needsPermission(Permission)
 
     var bubbleLabel: String {
         switch self {
@@ -23,6 +25,7 @@ enum DictationState: Equatable {
         case .meetingProcessing(let step): step
         case .done(let msg): msg
         case .error(let msg): msg
+        case .needsPermission(let p): p.message
         }
     }
 
@@ -58,6 +61,15 @@ final class DictationController: ObservableObject {
     private var recordingStartedAt: Date?
     private var hideTask: Task<Void, Never>?
     private var meeting: MeetingSession?
+    /// Started by a click: keeps listening until the finish button or another click.
+    private var handsFree = false
+
+    private var isReadyForDictation: Bool {
+        switch state {
+        case .idle, .done, .error: true
+        default: false
+        }
+    }
 
     /// Shorter holds are treated as an accidental tap (or Option used as a modifier) and ignored.
     private let minimumHold: TimeInterval = 0.35
@@ -71,25 +83,71 @@ final class DictationController: ObservableObject {
         hotkey.onPress = { [weak self] in Task { @MainActor in self?.beginRecording() } }
         hotkey.onRelease = { [weak self] in Task { @MainActor in await self?.finishRecording() } }
         hotkey.start()
+        bubble.show()
 
         Task {
-            _ = await AudioRecorder.requestPermission()
             // Warm the model in the background so the first dictation is fast.
             show(.loadingModel)
             do {
                 try await transcriber.prepare(model: settings.whisperModel)
-                show(.done("Ready — hold \(settings.hotkey.label)"), hideAfter: 2)
             } catch {
                 show(.error("Couldn't load speech model"), hideAfter: 4)
+                return
+            }
+            await ensurePermissions()
+            show(.done("Ready: click me or hold \(settings.hotkey.label)"), hideAfter: 3)
+        }
+    }
+
+    /// Waits until Microphone and Accessibility are granted, showing which one is missing.
+    private func ensurePermissions() async {
+        if !(await AudioRecorder.requestPermission()) {
+            show(.needsPermission(.microphone))
+            while AVCaptureDevice.authorizationStatus(for: .audio) != .authorized {
+                try? await Task.sleep(for: .seconds(2))
             }
         }
+        if !Permissions.hasAccessibility {
+            show(.needsPermission(.accessibility))
+            while !Permissions.hasAccessibility {
+                try? await Task.sleep(for: .seconds(2))
+            }
+            // Key monitors added before access was granted don't receive events: re-add them.
+            hotkey.stop()
+            hotkey.start()
+        }
+    }
+
+    func openMeetingsFolder() {
+        let folder = URL.documentsDirectory.appending(path: "Fala/Meetings", directoryHint: .isDirectory)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(lastMeetingFolder ?? folder)
     }
 
     // MARK: - Dictation
 
-    private func beginRecording() {
-        // The microphone is busy while a meeting records.
-        guard state != .listening, !state.isMeeting else { return }
+    /// Click on the bubble: start hands-free dictation, or finish it if already listening.
+    func toggleDictation() {
+        if state == .listening {
+            Task { await finishRecording(force: true) }
+        } else {
+            beginRecording(handsFree: true)
+        }
+    }
+
+    /// Stops listening and throws the audio away.
+    func cancelDictation() {
+        guard state == .listening else { return }
+        _ = recorder.stop()
+        recordingStartedAt = nil
+        handsFree = false
+        hide()
+    }
+
+    private func beginRecording(handsFree: Bool = false) {
+        // The microphone is busy while a meeting records; never start over a pending permission prompt.
+        guard isReadyForDictation else { return }
+        self.handsFree = handsFree
         do {
             recorder.onChunk = nil
             try recorder.start(keepSamples: true)
@@ -100,12 +158,15 @@ final class DictationController: ObservableObject {
         }
     }
 
-    private func finishRecording() async {
+    /// Key released (or finish clicked). A release ends only hold-to-talk dictation.
+    private func finishRecording(force: Bool = false) async {
         guard state == .listening, let started = recordingStartedAt else { return }
+        if handsFree && !force { return }
         let samples = recorder.stop()
         recordingStartedAt = nil
+        handsFree = false
 
-        guard Date().timeIntervalSince(started) >= minimumHold,
+        guard force || Date().timeIntervalSince(started) >= minimumHold,
               samples.count > Int(AudioRecorder.sampleRate * 0.3) else {
             hide()
             return
@@ -149,7 +210,7 @@ final class DictationController: ObservableObject {
     func toggleMeeting() {
         if case .meetingRecording = state {
             Task { await stopMeeting() }
-        } else if !state.isMeeting {
+        } else if isReadyForDictation {
             Task { await startMeeting() }
         }
     }
@@ -223,7 +284,7 @@ final class DictationController: ObservableObject {
     private func show(_ newState: DictationState, hideAfter: TimeInterval? = nil) {
         hideTask?.cancel()
         state = newState
-        bubble.show()
+        bubble.position()
         if let hideAfter {
             hideTask = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(hideAfter))
@@ -233,8 +294,9 @@ final class DictationController: ObservableObject {
         }
     }
 
+    /// Returns the bubble to its small resting state (it stays on screen).
     private func hide() {
+        hideTask?.cancel()
         state = .idle
-        bubble.hide()
     }
 }
