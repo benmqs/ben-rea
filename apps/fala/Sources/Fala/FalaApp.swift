@@ -17,6 +17,7 @@ struct FalaApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let controller = DictationController()
 
