@@ -7,12 +7,14 @@ struct ClaudeClient {
         case missingKey
         case http(Int, String)
         case refused
+        case truncated
 
         var errorDescription: String? {
             switch self {
             case .missingKey: "Add your Anthropic API key in Settings."
             case .http(let code, let body): "Claude request failed (HTTP \(code)): \(body.prefix(200))"
             case .refused: "Claude declined this request."
+            case .truncated: "Claude's reply was cut off."
             }
         }
     }
@@ -20,7 +22,16 @@ struct ClaudeClient {
     let apiKey: String
     let model: String
 
-    func complete(system: String, user: String, effort: String, maxTokens: Int, timeout: TimeInterval) async throws -> String {
+    /// Opens the connection to the API ahead of the first request (URLSession.shared reuses it).
+    static func warmUp() {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 5
+        URLSession.shared.dataTask(with: request).resume()
+    }
+
+    func complete(system: String, user: String, effort: String, maxTokens: Int, timeout: TimeInterval,
+                  thinking: Bool = true) async throws -> String {
         guard !apiKey.isEmpty else { throw ClaudeError.missingKey }
 
         var body: [String: Any] = [
@@ -30,6 +41,10 @@ struct ClaudeClient {
             "messages": [["role": "user", "content": user]],
             "output_config": ["effort": effort],
         ]
+        // Haiku 5.5 accepts disabled thinking at effort high or below; Opus 5.5 rejects it with a 400.
+        if !thinking, model.hasPrefix("claude-haiku") {
+            body["thinking"] = ["type": "disabled"]
+        }
         var betas: [String] = []
         if model.hasPrefix("claude-opus") {
             // If the primary model declines, let the API retry on a fallback model in the same call.
@@ -56,6 +71,8 @@ struct ClaudeClient {
 
         let decoded = try JSONDecoder().decode(MessageResponse.self, from: data)
         if decoded.stop_reason == "refusal" { throw ClaudeError.refused }
+        // A cut-off reply must never be pasted as if it were complete; the caller falls back to the raw text.
+        if decoded.stop_reason == "max_tokens" { throw ClaudeError.truncated }
         return decoded.content
             .filter { $0.type == "text" }
             .compactMap(\.text)
@@ -102,10 +119,15 @@ struct TextCleaner {
             system: system,
             user: "<transcript>\n\(transcript)\n</transcript>",
             effort: "low", // short, mechanical task: keep latency low
-            maxTokens: 4096,
-            timeout: 30
+            maxTokens: min(32_000, 2_048 + transcript.utf8.count),
+            // Fall back to the raw transcript quickly instead of stalling on a slow network.
+            timeout: min(30, 8 + Double(transcript.count) / 150),
+            thinking: false
         )
-        return text.isEmpty ? transcript : text
+        // A clean-up only removes or lightly reformats; much longer output means the model
+        // answered the dictation or added content.
+        if text.isEmpty || text.count > transcript.count * 3 / 2 + 40 { return transcript }
+        return text
     }
 }
 
@@ -132,8 +154,8 @@ struct MeetingSummarizer {
             system: Self.systemPrompt,
             user: "<transcript>\n\(transcript)\n</transcript>",
             effort: "medium",
-            maxTokens: 8000,
-            timeout: 180
+            maxTokens: 16_000,
+            timeout: 300
         )
     }
 }

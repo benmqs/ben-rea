@@ -5,8 +5,10 @@ A macOS menu bar app for voice typing and meeting notes.
 - **Dictation:** hold the push-to-talk key (Right Option by default), speak, release.
   Fala transcribes on your Mac with Whisper, polishes the text with Claude, and pastes
   it where your cursor is. If no text field has focus, it copies the text instead.
-- **Bubble:** a small pill at the bottom of the screen shows listening (with a live
-  level), transcribing, polishing and pasted/copied.
+- **Bubble:** a small black pill sits at the bottom centre of the screen. Click it to dictate
+  hands-free (✕ cancels, ✓ finishes and pastes), or right-click it for meetings, Settings and
+  Quit. It shows live level bars while listening and a short note above it when something
+  needs your attention.
 - **Languages:** Portuguese, English and Spanish, or auto-detect.
 - **Meetings:** choose **Record a meeting** from the menu bar icon. Fala records your
   microphone and the computer's audio (Zoom, Meet, Teams…) as separate tracks, so the

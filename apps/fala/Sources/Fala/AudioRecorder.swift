@@ -36,6 +36,26 @@ final class Resampler {
         return Array(UnsafeBufferPointer(start: channel, count: Int(out.frameLength)))
     }
 
+    /// True when at least `minFrames` 50 ms frames are louder than about -50 dBFS
+    /// (the point where the level meter reads zero).
+    static func containsSpeech(_ samples: ArraySlice<Float>, threshold: Float = 0.003, minFrames: Int = 3) -> Bool {
+        let frame = 800     // 50 ms at 16 kHz
+        return samples.withUnsafeBufferPointer { buffer in
+            var loud = 0
+            var i = 0
+            while i + frame <= buffer.count {
+                var sum: Float = 0
+                for j in i..<(i + frame) { sum += buffer[j] * buffer[j] }
+                if (sum / Float(frame)).squareRoot() > threshold {
+                    loud += 1
+                    if loud >= minFrames { return true }
+                }
+                i += frame
+            }
+            return false
+        }
+    }
+
     /// RMS level mapped to 0...1 for meters.
     static func level(of samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0 }
@@ -65,21 +85,40 @@ final class AudioRecorder {
         await AVCaptureDevice.requestAccess(for: .audio)
     }
 
+    private var configObserver: NSObjectProtocol?
+
     func start(keepSamples: Bool = true) throws {
         self.keepSamples = keepSamples
         lock.withLock { samples.removeAll(keepingCapacity: true) }
         // A fresh engine each time picks up the current default microphone. A reused engine keeps
         // the format of the device it first saw (e.g. 24 kHz AirPods), and installing a tap with
         // that stale format after switching to a 48 kHz mic raises an exception and crashes.
+        removeConfigObserver()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         engine = AVAudioEngine()
+        try startEngine()
+        // The engine stops itself when the input device changes mid-recording (AirPods connect,
+        // dock, USB mic). Restart it on the new device so a meeting keeps recording.
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            guard let self, !self.engine.isRunning else { return }
+            self.engine.inputNode.removeTap(onBus: 0)
+            do {
+                try self.startEngine()
+            } catch {
+                NSLog("Fala microphone restart failed: %@", String(describing: error))
+            }
+        }
+    }
+
+    private func startEngine() throws {
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw RecorderError.noInput
         }
-
         input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             self?.process(buffer)
         }
@@ -87,8 +126,14 @@ final class AudioRecorder {
         try engine.start()
     }
 
+    private func removeConfigObserver() {
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
+    }
+
     /// Stops recording and returns what was kept since `start()`.
     func stop() -> [Float] {
+        removeConfigObserver()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         onLevel(0)

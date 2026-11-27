@@ -45,7 +45,7 @@ struct MenuContent: View {
         Button("Open meeting notes folder") { controller.openMeetingsFolder() }
         Divider()
         Text("Click the bubble or hold \(controller.settings.hotkey.label) to dictate")
-        SettingsLink { Text("Settings…") }
+        Button("Settings…") { AppActions.openSettings(controller: controller) }
         Button("Quit Fala") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
     }

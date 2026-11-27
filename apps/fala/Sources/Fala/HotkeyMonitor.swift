@@ -1,10 +1,12 @@
 import AppKit
 
 /// Watches a single modifier key held on its own (push-to-talk).
-/// Global monitoring of modifier keys needs the Accessibility permission.
+/// Global monitoring of keys needs the Accessibility permission.
 final class HotkeyMonitor {
     var onPress: () -> Void = {}
     var onRelease: () -> Void = {}
+    /// The key turned out to be a modifier for another key (Option+E, Cmd+C…).
+    var onCancel: () -> Void = {}
 
     private var globalMonitor: Any?
     private var localMonitor: Any?
@@ -16,10 +18,12 @@ final class HotkeyMonitor {
     }
 
     func start() {
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] in
+        stop()
+        let mask: NSEvent.EventTypeMask = [.flagsChanged, .keyDown]
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] in
             self?.handle($0)
         }
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] in
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] in
             self?.handle($0)
             return $0
         }
@@ -28,13 +32,20 @@ final class HotkeyMonitor {
     func stop() {
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        globalMonitor = nil
+        localMonitor = nil
     }
 
     private func handle(_ event: NSEvent) {
-        guard event.keyCode == keyCodeProvider() else {
-            // Another modifier joined in (e.g. Option+Shift shortcut): cancel nothing, just ignore.
+        if event.type == .keyDown {
+            // An ordinary key while the hotkey is held: it is being used as a modifier.
+            if isDown {
+                isDown = false
+                onCancel()
+            }
             return
         }
+        guard event.keyCode == keyCodeProvider() else { return }
         let pressed = isPressed(event)
         if pressed && !isDown {
             isDown = true

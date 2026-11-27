@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import ServiceManagement
 import SwiftUI
 
 enum Hotkey: String, CaseIterable, Identifiable {
@@ -53,10 +54,21 @@ final class AppSettings: ObservableObject {
     /// Names, brands and jargon Whisper and the cleanup step should spell correctly, one per line.
     @AppStorage("vocabulary") var vocabulary: String = ""
 
+    private var cachedKey: String?
+
+    /// Cached after the first read, trimmed on write (a pasted trailing newline would break the header).
     var anthropicKey: String {
-        get { Keychain.read("anthropic-api-key") ?? "" }
+        get {
+            if let cachedKey { return cachedKey }
+            let stored = Keychain.read("anthropic-api-key") ?? ""
+            cachedKey = stored
+            return stored
+        }
         set {
-            Keychain.write("anthropic-api-key", newValue)
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed != cachedKey else { return }
+            cachedKey = trimmed
+            Keychain.write("anthropic-api-key", trimmed)
             objectWillChange.send()
         }
     }
@@ -100,38 +112,71 @@ enum Keychain {
 
 struct SettingsView: View {
     @EnvironmentObject var controller: DictationController
-    @State private var key: String = ""
+    @AppStorage("hotkey") private var hotkey: Hotkey = .rightOption
+    @AppStorage("language") private var language: SpokenLanguage = .auto
+    @AppStorage("whisperModel") private var whisperModel = "openai_whisper-large-v3-v20240930_turbo"
+    @AppStorage("cleanupEnabled") private var cleanupEnabled = true
+    @AppStorage("cleanupModel") private var cleanupModel = "claude-haiku-5-5"
+    @AppStorage("vocabulary") private var vocabulary = ""
+    @State private var key = ""
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+
+    private static let speechModels: [(id: String, name: String)] = [
+        ("openai_whisper-small", "Fastest (small)"),
+        ("openai_whisper-large-v3-v20240930_turbo_632MB", "Balanced (large v3 turbo, compressed)"),
+        ("openai_whisper-large-v3-v20240930_turbo", "Most accurate (large v3 turbo)"),
+    ]
 
     var body: some View {
-        let s = controller.settings
         Form {
             Section("Dictation") {
-                Picker("Push-to-talk key", selection: Binding(get: { s.hotkey }, set: { s.hotkey = $0 })) {
+                Picker("Push-to-talk key", selection: $hotkey) {
                     ForEach(Hotkey.allCases) { Text($0.label).tag($0) }
                 }
-                Picker("Language", selection: Binding(get: { s.language }, set: { s.language = $0 })) {
+                Picker("Language", selection: $language) {
                     ForEach(SpokenLanguage.allCases) { Text($0.label).tag($0) }
                 }
-                TextField("Whisper model", text: Binding(get: { s.whisperModel }, set: { s.whisperModel = $0 }))
-                Text("Changing the model downloads it on next use.").font(.caption).foregroundStyle(.secondary)
+                Picker("Speech model", selection: $whisperModel) {
+                    ForEach(Self.speechModels, id: \.id) { Text($0.name).tag($0.id) }
+                    if !Self.speechModels.contains(where: { $0.id == whisperModel }) {
+                        Text(whisperModel).tag(whisperModel)   // keep a custom value selectable
+                    }
+                }
+                .onChange(of: whisperModel) { _, model in controller.preloadModel(model) }
+                Text("A new model is downloaded as soon as you pick it.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("Clean-up with Claude") {
-                Toggle("Clean up text before pasting", isOn: Binding(get: { s.cleanupEnabled }, set: { s.cleanupEnabled = $0 }))
-                Picker("Model", selection: Binding(get: { s.cleanupModel }, set: { s.cleanupModel = $0 })) {
+                Toggle("Clean up text before pasting", isOn: $cleanupEnabled)
+                Picker("Model", selection: $cleanupModel) {
                     Text("Claude Haiku 5.5 (fast, about $0.0001 per dictation)").tag("claude-haiku-5-5")
                     Text("Claude Opus 5.5 (most careful, slower, about $0.005)").tag("claude-opus-5-5")
                 }
                 SecureField("Anthropic API key", text: $key)
-                    .onSubmit { s.anthropicKey = key }
-                Button("Save key") { s.anthropicKey = key }
+                    .onChange(of: key) { _, value in controller.settings.anthropicKey = value }
+                Text(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                     ? "No key: text is pasted without clean-up."
+                     : "Saved in your Keychain.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("Personal vocabulary (one per line)") {
-                TextEditor(text: Binding(get: { s.vocabulary }, set: { s.vocabulary = $0 }))
-                    .frame(minHeight: 80)
+                TextEditor(text: $vocabulary).frame(minHeight: 80)
+            }
+            Section("General") {
+                Toggle("Open Fala at login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, on in
+                        guard on != (SMAppService.mainApp.status == .enabled) else { return }
+                        do {
+                            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                        } catch {
+                            NSLog("Fala login item: %@", String(describing: error))
+                            launchAtLogin = SMAppService.mainApp.status == .enabled
+                        }
+                    }
             }
         }
         .formStyle(.grouped)
-        .frame(width: 460)
-        .onAppear { key = s.anthropicKey }
+        .frame(width: 460, height: 640)
+        .onAppear { key = controller.settings.anthropicKey }
     }
 }

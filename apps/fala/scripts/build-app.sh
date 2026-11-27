@@ -18,7 +18,11 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 # Accessibility permissions across rebuilds. Override with FALA_SIGN_IDENTITY; falls back to
 # an ad-hoc signature, which makes macOS ask again after every rebuild.
 IDENTITY="${FALA_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
-  | sed -n 's/.*"\(Apple Development[^"]*\)".*/\1/p' | head -1)}"
+  | awk '/"Apple Development/ {print $2; exit}')}"
+if [ -z "$IDENTITY" ]; then
+  echo "WARNING: no Apple Development identity found; using an ad-hoc signature." >&2
+  echo "         macOS will ask for Microphone and Accessibility again after every rebuild." >&2
+fi
 codesign --force --sign "${IDENTITY:--}" --entitlements Resources/Fala.entitlements "$APP"
 echo "Signed with: ${IDENTITY:-ad-hoc signature}"
 
