@@ -48,12 +48,14 @@ final class Resampler {
 /// With `keepSamples` it accumulates everything for `stop()` to return (dictation); either way
 /// each converted chunk is passed to `onChunk` (meetings stream it to disk).
 final class AudioRecorder {
+    enum RecorderError: Error { case noInput }
+
     static let sampleRate = Resampler.sampleRate
 
     var onLevel: (Float) -> Void = { _ in }
     var onChunk: (([Float]) -> Void)?
 
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private let resampler = Resampler()
     private var samples: [Float] = []
     private var keepSamples = true
@@ -66,10 +68,18 @@ final class AudioRecorder {
     func start(keepSamples: Bool = true) throws {
         self.keepSamples = keepSamples
         lock.withLock { samples.removeAll(keepingCapacity: true) }
+        // A fresh engine each time picks up the current default microphone. A reused engine keeps
+        // the format of the device it first saw (e.g. 24 kHz AirPods), and installing a tap with
+        // that stale format after switching to a 48 kHz mic raises an exception and crashes.
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        engine = AVAudioEngine()
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw RecorderError.noInput
+        }
 
-        input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             self?.process(buffer)
         }
